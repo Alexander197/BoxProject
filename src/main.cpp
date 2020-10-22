@@ -10,16 +10,14 @@
 #include <list>
 #include <iterator>
 
-
 const int ADXL_DEVICE = 0x53;
 const int DATA_REG = 0x32;
 const unsigned int TO_READ = 6;
 
-const float ACCELERATION_THRESHOLD = 2.97;
-const int SQUARE_THRESHOLD = 400;
-const int SERIES_INTERVAL = 700;
-
 const float g = 9.8;
+const float ACCELERATION_THRESHOLD_IN_G = 2.97;
+// const int SQUARE_THRESHOLD = 400;
+const int SERIES_INTERVAL = 700;
 
 const int m = 2;
 
@@ -396,9 +394,11 @@ void adcSetup(){
   analogReadResolution(11);
   analogSetAttenuation(ADC_6db);
 
+
   adc_chars = (esp_adc_cal_characteristics_t *)calloc(1, sizeof(esp_adc_cal_characteristics_t));
-  esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_6, ADC_WIDTH_BIT_11, ESP_ADC_CAL_VAL_DEFAULT_VREF, adc_chars);
+  /*esp_adc_cal_value_t val_type = */esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_6, ADC_WIDTH_BIT_11, ESP_ADC_CAL_VAL_DEFAULT_VREF, adc_chars);
   vRef = vRef *(0.5f + (float)adc_chars->vref / 2200.0f);
+  
   delay(200);
 
   // int min = 2047;
@@ -451,6 +451,8 @@ void setup() {
   pServer->getAdvertising()->start();
 
   adcSetup();
+  adxlMeasure();
+  adxlSleep();
 
   xTaskCreatePinnedToCore(batteryMeasurement, "BatteryLevel", 10000, NULL, 1, &battery, 1);
   xTaskCreatePinnedToCore(sleep, "SleepMode", 10000, NULL, 1, &sleepMode, 1);
@@ -458,25 +460,16 @@ void setup() {
   xTaskCreatePinnedToCore(bleSerial, "BleSerial", 10000, NULL, 1, &ble_Serial, 0);
   delay(500);
 }
-const float t0 = 0.001f;
-const float k = 0.8f;
-float gloveVelocity(float square, int duration){
-  return (square + (ACCELERATION_THRESHOLD - 1) * (float)duration) * g * t0 * sqrt((float)bagWeight / m / k);
+
+float MaxFloat(float array[], int length){
+  float max = 0;
+  for(int i = 0; i < length; i++)
+    if(max < array[i]) max = array[i];
+    return max;
 }
 
-const float KS = 30000.0f;
-int hitForce(float velocity) {
-    return velocity * sqrt((float)bagWeight * (float)m * KS / (bagWeight + m));
-}
-
-float hitEnergy(float velocity){
-  return 2 * m * m * velocity * velocity * bagWeight / (m + bagWeight) / (m + bagWeight);
-}
-
-int hitCheck(int force){
-  if(force > threshold) 
-    return force;
-  else return 0;
+int hitForce(float accInG) {
+    return accInG * (float)bagWeight;
 }
 
 unsigned long seriesTimer = 0;
@@ -489,43 +482,35 @@ unsigned int hits = 0;
 
 void loop() {
   if(trainingState){
-    int acceleration = 0;
-    int square = 0;
-    int max = 0;
-    int counter = 0;
-    int hitDuration = 0;
-    for(hitTimer = millis(); (acceleration = readAcceleration(1)) > ACCELERATION_THRESHOLD; counter++){
-      square += acceleration - ACCELERATION_THRESHOLD;
-      if(max < acceleration){ 
-        max = acceleration;
-        hitDuration = millis() - hitTimer;
+    float acceleration = readAcceleration(1);
+    if(acceleration >= ACCELERATION_THRESHOLD_IN_G){
+      float array[100] = {0};
+      seriesTimer = millis();
+      array[0] = acceleration;
+      for(int i = 1; i < 100; i++){
+        array[i] = readAcceleration(1);
+      }
+      float max = MaxFloat(array, 100);
+      int force = hitForce(max);
+      if(force > threshold){
+        hits ++;
+        sendData(1, force, hits);
+        seriesHits ++;
       }
     }
-    if(counter != 0){
-      float velocity = gloveVelocity(square, counter);
-      int force = hitForce(velocity);
-      if(hitCheck(force) != 0) { // hit
-        seriesTimer = millis();
-        // Serial.print("Glove velocity: ");
-        // Serial.print(velocity);
-        // Serial.print("hitDuration: ");
-        // Serial.println(hitDuration);
-
-        hits++;
-        seriesHits++; 
-        sendData(1, force, (int)(hitEnergy(velocity) * 1000.0f));
-      }
+    if(seriesHits > 1){
+      if(millis() - seriesTimer > SERIES_INTERVAL){
+        seriesNumber++;
+        sendData(2, seriesHits, seriesNumber);
+        seriesHits = 0;
+       }
     }
-    if(millis() - seriesTimer > SERIES_INTERVAL && seriesHits > 1){ //series
-      seriesNumber++;
-      sendData(2, seriesHits, seriesNumber);
-      seriesHits = 0;
+    else if(seriesHits == 1){
+        if(millis() - seriesTimer > SERIES_INTERVAL) seriesHits = 0;
     }
-    else if (millis() - seriesTimer > SERIES_INTERVAL && seriesHits == 1)
-      seriesHits = 0;
   }
-  // Serial.println(ESP.getFreeHeap());
-  // delay(1000);
+  // // Serial.println(ESP.getFreeHeap());
+  // // delay(1000);
 }
 
 void startTraining(uint8_t *val){
@@ -537,6 +522,10 @@ void startTraining(uint8_t *val){
   // Serial.print("\t");
   // Serial.print(F("Threshold: "));
   // Serial.println(threshold);
+  seriesHits = 0;
+  seriesNumber = 0;
+  hits = 0;
+  seriesTimer = 0;
   trainingState = true;
 }
 void stopTraining(){
